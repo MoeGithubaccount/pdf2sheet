@@ -350,7 +350,6 @@ def write_outputs(df: pd.DataFrame, file_id: str) -> Tuple[str, str]:
 def health():
     return {"ok": True, "status": "up"}
 
-
 @app.head("/")
 def head_root():
     return HTMLResponse("")

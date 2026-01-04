@@ -1,0 +1,62 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>PDF → Spreadsheet</title>
+  <style>
+    body { font-family: -apple-system, system-ui, Arial; max-width: 760px; margin: 40px auto; padding: 0 16px; }
+    .card { border: 1px solid #ddd; border-radius: 12px; padding: 18px; }
+    button { padding: 10px 14px; border-radius: 10px; border: 1px solid #111; cursor: pointer; }
+    input { padding: 10px; }
+    .muted { color: #666; font-size: 14px; }
+    .links a { display: inline-block; margin-right: 14px; }
+    .error { color: #b00020; }
+  </style>
+</head>
+<body>
+  <h1>PDF → Spreadsheet</h1>
+  <p class="muted">Upload a business PDF with tables (invoices, statements, reports). Get CSV/XLSX instantly.</p>
+
+  <div class="card">
+    <input type="file" id="pdf" accept="application/pdf"/>
+    <button id="go">Convert</button>
+    <p id="status" class="muted"></p>
+    <p id="err" class="error"></p>
+    <div class="links" id="links"></div>
+  </div>
+
+  <script>
+    const go = document.getElementById("go");
+    const status = document.getElementById("status");
+    const err = document.getElementById("err");
+    const links = document.getElementById("links");
+
+    go.onclick = async () => {
+      err.textContent = "";
+      links.innerHTML = "";
+      const file = document.getElementById("pdf").files[0];
+      if (!file) { err.textContent = "Choose a PDF first."; return; }
+
+      status.textContent = "Converting…";
+      const fd = new FormData();
+      fd.append("file", file);
+
+      const res = await fetch("/convert", { method: "POST", body: fd });
+      const data = await res.json();
+
+      if (!data.ok) {
+        status.textContent = "";
+        err.textContent = data.error || "Conversion failed.";
+        return;
+      }
+
+      status.textContent = `Done. Extracted ${data.rows} rows × ${data.cols} cols.`;
+      links.innerHTML = `
+        <a href="${data.csv}">Download CSV</a>
+        <a href="${data.xlsx}">Download XLSX</a>
+      `;
+    };
+  </script>
+</body>
+</html>
+

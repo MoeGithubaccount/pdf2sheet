@@ -4,13 +4,13 @@ import time
 import uuid
 import shutil
 import subprocess
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict, Any
 
 import pandas as pd
 import pdfplumber
 import camelot
 
-from fastapi import FastAPI, UploadFile, File, Form, Query
+from fastapi import FastAPI, UploadFile, File, Form, Request
 from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.concurrency import run_in_threadpool
@@ -19,7 +19,7 @@ from fastapi.concurrency import run_in_threadpool
 # -----------------------------
 # App setup
 # -----------------------------
-app = FastAPI(title="pdf2sheet", version="1.0")
+app = FastAPI(title="pdf2sheet", version="1.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -29,7 +29,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # repo root (../)
+# repo root = one level above /app
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 UPLOAD_DIR = os.path.join(BASE_DIR, "uploads")
 OUTPUT_DIR = os.path.join(BASE_DIR, "outputs")
 
@@ -38,11 +39,13 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 
 # -----------------------------
-# Helpers: file + text cleanup
+# Helpers: safety + cleanup
 # -----------------------------
 def safe_filename(name: str) -> str:
-    name = name.strip().replace(" ", "_")
+    name = (name or "upload.pdf").strip().replace(" ", "_")
     name = re.sub(r"[^a-zA-Z0-9_\-.]+", "", name)
+    if not name.lower().endswith(".pdf"):
+        name += ".pdf"
     return name or "upload.pdf"
 
 
@@ -54,17 +57,30 @@ def count_pages(pdf_path: str) -> int:
         return 0
 
 
+# -----------------------------
+# Helpers: DF normalization
+# -----------------------------
+def _clean_cell(x: Any) -> str:
+    if x is None:
+        return ""
+    s = str(x)
+    s = s.replace("\u00a0", " ")  # non-breaking space
+    s = re.sub(r"\s+", " ", s).strip()
+    if s.lower() == "nan":
+        return ""
+    return s
+
+
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
-    # Make column names reasonable + unique
     cols = []
     for i, c in enumerate(df.columns):
         c = "" if c is None else str(c)
-        c = re.sub(r"\s+", " ", c).strip()
+        c = _clean_cell(c)
         if not c:
             c = f"col_{i+1}"
         cols.append(c)
 
-    # ensure unique
+    # make unique
     seen = {}
     uniq = []
     for c in cols:
@@ -80,9 +96,8 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 def drop_empty(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    # Trim whitespace in all cells
-    df = df.applymap(lambda x: re.sub(r"\s+", " ", str(x)).strip() if pd.notna(x) else "")
-    # Drop empty rows/cols
+    df = df.applymap(_clean_cell)
+    # drop empty columns/rows
     df = df.loc[:, (df != "").any(axis=0)]
     df = df.loc[(df != "").any(axis=1), :]
     return df
@@ -97,81 +112,113 @@ def normalize_dfs(dfs: List[pd.DataFrame]) -> pd.DataFrame:
         if df.empty:
             continue
         df = normalize_columns(df)
-
-        # Sometimes Camelot creates unnamed header rows; keep as-is but ensure not empty
         cleaned.append(df)
 
     if not cleaned:
         return pd.DataFrame()
 
-    # If multiple tables, stack them with a blank row between tables for readability
+    # stack tables with separator row (keeps multi-table PDFs readable)
     out = []
     for df in cleaned:
         out.append(df)
         out.append(pd.DataFrame([[""] * len(df.columns)], columns=df.columns))
     merged = pd.concat(out, ignore_index=True)
-    merged = drop_empty(merged) if not merged.empty else merged
+
+    # final cleanup
+    merged = drop_empty(merged)
     return merged
 
 
 # -----------------------------
-# Helpers: extraction
+# Helpers: extraction (Fast / Best)
 # -----------------------------
 def extract_pdfplumber_tables(pdf_path: str, max_pages: Optional[int] = None) -> List[pd.DataFrame]:
     """
-    Fast mode: pdfplumber table extraction. Best for digital PDFs with clean lines/text.
+    FAST: pdfplumber page.extract_tables().
     """
     dfs: List[pd.DataFrame] = []
+
+    # Table settings help borderline PDFs; these defaults are safe.
+    table_settings = {
+        "vertical_strategy": "lines",
+        "horizontal_strategy": "lines",
+        "snap_tolerance": 3,
+        "join_tolerance": 3,
+        "edge_min_length": 3,
+        "min_words_vertical": 1,
+        "min_words_horizontal": 1,
+        "intersection_tolerance": 3,
+    }
+
     with pdfplumber.open(pdf_path) as pdf:
         pages = pdf.pages if max_pages is None else pdf.pages[:max_pages]
         for page in pages:
             try:
-                tables = page.extract_tables() or []
+                tables = page.extract_tables(table_settings=table_settings) or []
                 for t in tables:
                     if not t or len(t) < 2:
                         continue
-                    df = pd.DataFrame(t[1:], columns=t[0])
+                    header = t[0]
+                    body = t[1:]
+                    df = pd.DataFrame(body, columns=header)
                     dfs.append(df)
             except Exception:
                 continue
+
     return dfs
 
 
 def extract_camelot_tables(pdf_path: str, pages: str = "all") -> List[pd.DataFrame]:
     """
-    Best mode: Camelot (try lattice then stream). Falls back handled outside.
+    BEST: try lattice then stream.
+    lattice works best when cell borders exist.
+    stream works when borders don't exist.
     """
     dfs: List[pd.DataFrame] = []
 
-    # Camelot can be sensitive. We try lattice first, then stream.
-    for flavor in ("lattice", "stream"):
-        try:
-            tables = camelot.read_pdf(pdf_path, pages=pages, flavor=flavor)
-            if tables and tables.n > 0:
-                for t in tables:
-                    df = t.df
-                    if df is None or df.empty:
-                        continue
-                    # Camelot returns all strings; treat first row as header if it looks like one
-                    # We'll keep it simple: use first row as header, rest as rows
-                    if df.shape[0] >= 2:
-                        header = df.iloc[0].tolist()
-                        body = df.iloc[1:].reset_index(drop=True)
-                        body.columns = header
-                        dfs.append(body)
-            if dfs:
-                return dfs
-        except Exception:
-            continue
+    # Try lattice
+    try:
+        tables = camelot.read_pdf(pdf_path, pages=pages, flavor="lattice")
+        if tables and tables.n > 0:
+            for t in tables:
+                df = t.df
+                if df is None or df.empty:
+                    continue
+                if df.shape[0] >= 2:
+                    header = df.iloc[0].tolist()
+                    body = df.iloc[1:].reset_index(drop=True)
+                    body.columns = header
+                    dfs.append(body)
+    except Exception:
+        pass
+
+    if dfs:
+        return dfs
+
+    # Try stream
+    try:
+        tables = camelot.read_pdf(pdf_path, pages=pages, flavor="stream")
+        if tables and tables.n > 0:
+            for t in tables:
+                df = t.df
+                if df is None or df.empty:
+                    continue
+                if df.shape[0] >= 2:
+                    header = df.iloc[0].tolist()
+                    body = df.iloc[1:].reset_index(drop=True)
+                    body.columns = header
+                    dfs.append(body)
+    except Exception:
+        pass
 
     return dfs
 
 
 # -----------------------------
-# Helpers: "smart" auto quality
+# Helpers: Auto quality + OCR
 # -----------------------------
 def has_text_layer(pdf_path: str, max_pages: int = 2) -> bool:
-    """Quick check: if first pages contain selectable text, it’s likely NOT scanned."""
+    """If first pages contain selectable text, it's likely NOT scanned."""
     try:
         with pdfplumber.open(pdf_path) as pdf:
             for page in pdf.pages[:max_pages]:
@@ -183,9 +230,9 @@ def has_text_layer(pdf_path: str, max_pages: int = 2) -> bool:
         return False
 
 
-def tables_look_weak(dfs: List[pd.DataFrame]) -> bool:
+def tables_look_weak(dfs: List[pd.DataFrame], min_fill_ratio: float = 0.45) -> bool:
     """
-    Heuristic: treat results as weak if:
+    Treat results as weak if:
     - no dfs
     - only tiny tables
     - mostly empty cells
@@ -202,7 +249,6 @@ def tables_look_weak(dfs: List[pd.DataFrame]) -> bool:
             continue
         if df.shape[0] < 2 or df.shape[1] < 2:
             continue
-
         meaningful_tables += 1
         vals = df.astype(str).replace("nan", "").values
         total_cells += vals.size
@@ -212,20 +258,22 @@ def tables_look_weak(dfs: List[pd.DataFrame]) -> bool:
         return True
 
     fill_ratio = non_empty / total_cells
-    return fill_ratio < 0.55
+    return fill_ratio < min_fill_ratio
 
 
 def ocr_pdf_to_searchable(pdf_path: str, out_path: str) -> bool:
     """
-    Convert scanned PDF to searchable PDF using Tesseract.
-    Requires: tesseract-ocr + poppler-utils (pdftoppm) + ghostscript in Docker.
+    Convert scanned PDF to searchable PDF using:
+    - pdftoppm (poppler-utils) to render images
+    - tesseract to OCR each page image into PDF
+    - ghostscript to merge PDFs
     """
     workdir = None
     try:
         workdir = os.path.join(UPLOAD_DIR, f"ocr_{uuid.uuid4().hex}")
         os.makedirs(workdir, exist_ok=True)
 
-        # PDF -> PNG pages
+        # 1) Render pages to PNG
         prefix = os.path.join(workdir, "page")
         subprocess.run(
             ["pdftoppm", "-png", "-r", "250", pdf_path, prefix],
@@ -240,10 +288,10 @@ def ocr_pdf_to_searchable(pdf_path: str, out_path: str) -> bool:
         if not images:
             return False
 
-        # OCR each image -> PDF part
-        pdf_parts = []
+        # 2) OCR each image to PDF part
+        pdf_parts: List[str] = []
         for img in images:
-            base = img[:-4]  # remove .png
+            base = img[:-4]  # strip .png
             subprocess.run(
                 ["tesseract", img, base, "pdf"],
                 check=True,
@@ -257,8 +305,15 @@ def ocr_pdf_to_searchable(pdf_path: str, out_path: str) -> bool:
         if not pdf_parts:
             return False
 
-        # Merge using ghostscript
-        gs_cmd = ["gs", "-q", "-dBATCH", "-dNOPAUSE", "-sDEVICE=pdfwrite", f"-sOutputFile={out_path}"] + pdf_parts
+        # 3) Merge parts into a single searchable PDF
+        gs_cmd = [
+            "gs",
+            "-q",
+            "-dBATCH",
+            "-dNOPAUSE",
+            "-sDEVICE=pdfwrite",
+            f"-sOutputFile={out_path}",
+        ] + pdf_parts
         subprocess.run(gs_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
         return True
@@ -276,9 +331,8 @@ def write_outputs(df: pd.DataFrame, file_id: str) -> Tuple[str, str]:
     csv_path = os.path.join(OUTPUT_DIR, f"{file_id}.csv")
     xlsx_path = os.path.join(OUTPUT_DIR, f"{file_id}.xlsx")
 
-    # Always write something (even empty) so UI doesn't break
     if df is None or df.empty:
-        empty = pd.DataFrame({"message": ["No tables were detected. Try Best/OCR or a clearer PDF."]})
+        empty = pd.DataFrame({"message": ["No tables detected. Try a clearer PDF or OCR."]})
         empty.to_csv(csv_path, index=False)
         empty.to_excel(xlsx_path, index=False)
         return csv_path, xlsx_path
@@ -289,44 +343,55 @@ def write_outputs(df: pd.DataFrame, file_id: str) -> Tuple[str, str]:
 
 
 # -----------------------------
-# UI
+# HTML UI
 # -----------------------------
 @app.get("/", response_class=HTMLResponse)
 def home():
-    # Simple built-in UI (works even if templates/ isn't mounted)
     return """
 <!doctype html>
 <html>
-<head><meta charset="utf-8"><title>pdf2sheet</title></head>
-<body style="font-family: system-ui; max-width: 760px; margin: 40px auto;">
-  <h1>pdf2sheet</h1>
-  <p>Upload a PDF and download CSV/XLSX.</p>
-  <form action="/convert" method="post" enctype="multipart/form-data">
-    <label>Mode:</label>
-    <select name="mode">
+<head>
+  <meta charset="utf-8">
+  <title>pdf2sheet</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+</head>
+<body style="font-family: system-ui; max-width: 860px; margin: 40px auto; padding: 0 12px;">
+  <h1 style="margin-bottom: 6px;">pdf2sheet</h1>
+  <p style="margin-top: 0; color: #444;">Upload a PDF and download CSV/XLSX.</p>
+
+  <form action="/convert" method="post" enctype="multipart/form-data"
+        style="border: 1px solid #eee; padding: 16px; border-radius: 12px;">
+    <label style="display:block; font-weight:600;">Mode:</label>
+    <select name="mode" style="padding: 8px; margin-top: 8px;">
       <option value="auto" selected>auto (recommended)</option>
       <option value="fast">fast</option>
       <option value="best">best</option>
       <option value="ocr">ocr</option>
     </select>
-    <br><br>
-    <input type="file" name="file" accept="application/pdf" required />
-    <br><br>
-    <button type="submit">Convert</button>
+
+    <div style="height: 14px;"></div>
+
+    <input type="file" name="file" accept="application/pdf" required style="padding: 8px;" />
+    <div style="height: 14px;"></div>
+
+    <button type="submit" style="padding: 10px 14px; border-radius: 10px; border: 0; cursor:pointer;">
+      Convert
+    </button>
+
+    <p style="margin-top: 12px; color:#666; font-size: 13px;">
+      Tip: Use <b>auto</b>. It switches to OCR for scanned PDFs automatically.
+    </p>
   </form>
-  <hr>
-  <p><small>Tip: Use <b>auto</b>. It switches to OCR for scanned PDFs automatically.</small></p>
 </body>
 </html>
 """
 
 
 # -----------------------------
-# Download endpoints
+# Downloads
 # -----------------------------
 @app.get("/download/{filename}")
 def download(filename: str):
-    # Only allow .csv or .xlsx from output dir
     if not (filename.endswith(".csv") or filename.endswith(".xlsx")):
         return JSONResponse({"ok": False, "error": "Invalid file type."}, status_code=400)
 
@@ -339,67 +404,120 @@ def download(filename: str):
 
 
 # -----------------------------
-# Convert endpoint
+# Convert
 # -----------------------------
+def _wants_html(request: Request) -> bool:
+    """
+    If user submits from browser form, they typically accept text/html.
+    If API client requests JSON, they send Accept: application/json.
+    """
+    accept = (request.headers.get("accept") or "").lower()
+    # Most browsers send 'text/html,...'
+    return "text/html" in accept and "application/json" not in accept
+
+
+def _html_result(payload: Dict[str, Any]) -> HTMLResponse:
+    file_id = payload["file_id"]
+    csv_url = payload["downloads"]["csv"]
+    xlsx_url = payload["downloads"]["xlsx"]
+
+    return HTMLResponse(
+        f"""
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>pdf2sheet — result</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+</head>
+<body style="font-family: system-ui; max-width: 860px; margin: 40px auto; padding: 0 12px;">
+  <h1 style="margin-bottom: 6px;">Done ✅</h1>
+  <p style="margin-top: 0; color:#444;">
+    Mode used: <b>{payload.get("mode_used")}</b> • Pages: <b>{payload.get("pages")}</b> •
+    Rows: <b>{payload.get("rows")}</b> • Cols: <b>{payload.get("cols")}</b> •
+    Time: <b>{payload.get("elapsed_s")}s</b>
+  </p>
+
+  <div style="display:flex; gap:12px; flex-wrap: wrap; margin: 18px 0;">
+    <a href="{csv_url}" style="padding: 10px 14px; border-radius: 10px; background:#111; color:#fff; text-decoration:none;">
+      Download CSV
+    </a>
+    <a href="{xlsx_url}" style="padding: 10px 14px; border-radius: 10px; background:#111; color:#fff; text-decoration:none;">
+      Download XLSX
+    </a>
+    <a href="/" style="padding: 10px 14px; border-radius: 10px; border:1px solid #ddd; text-decoration:none; color:#111;">
+      Convert another
+    </a>
+  </div>
+
+  <details style="margin-top: 10px;">
+    <summary style="cursor:pointer;">Details</summary>
+    <pre style="background:#f6f6f6; padding:12px; border-radius: 10px; overflow:auto;">{payload}</pre>
+  </details>
+</body>
+</html>
+"""
+    )
+
+
 @app.post("/convert")
 async def convert(
+    request: Request,
     file: UploadFile = File(...),
     mode: str = Form("auto"),
 ):
     started = time.time()
     file_id = uuid.uuid4().hex
 
-    # Save upload
     original_name = safe_filename(file.filename or "upload.pdf")
     pdf_path = os.path.join(UPLOAD_DIR, f"{file_id}_{original_name}")
 
     content = await file.read()
     if not content:
-        return JSONResponse({"ok": False, "error": "Empty upload."}, status_code=400)
+        resp = {"ok": False, "error": "Empty upload."}
+        return HTMLResponse(resp["error"], status_code=400) if _wants_html(request) else JSONResponse(resp, status_code=400)
 
     with open(pdf_path, "wb") as f:
         f.write(content)
 
-    pages = count_pages(pdf_path)
+    pages = await run_in_threadpool(count_pages, pdf_path)
 
-    # Normalize mode
     used_mode = (mode or "auto").lower().strip()
     if used_mode not in ("auto", "fast", "best", "ocr"):
         used_mode = "auto"
 
-    # AUTO QUALITY LOGIC:
-    # 1) If scanned (no text layer) -> OCR -> treat as "best"
-    # 2) Otherwise: try Fast first, if no tables OR weak tables -> Best
-    working_pdf = pdf_path
+    # Decide scanned vs not
     scanned = await run_in_threadpool(lambda: not has_text_layer(pdf_path))
+    working_pdf = pdf_path
 
-    if used_mode in ("ocr",) or (used_mode == "auto" and scanned):
-        used_mode = "ocr"
+    # 1) OCR path (forced or auto+scanned)
+    if used_mode == "ocr" or (used_mode == "auto" and scanned):
         ocr_path = os.path.join(UPLOAD_DIR, f"{file_id}_ocr.pdf")
         ok = await run_in_threadpool(ocr_pdf_to_searchable, pdf_path, ocr_path)
         if not ok:
-            return JSONResponse(
-                {"ok": False, "error": "Scanned PDF detected, but OCR failed on the server."},
-                status_code=500,
-            )
-        working_pdf = ocr_path
+            resp = {"ok": False, "error": "Scanned PDF detected, but OCR failed on the server."}
+            return HTMLResponse(resp["error"], status_code=500) if _wants_html(request) else JSONResponse(resp, status_code=500)
 
-        # OCR acts like Best extraction afterwards
+        working_pdf = ocr_path
+        used_mode = "ocr"
+
+        # OCR behaves like Best afterward
         dfs = await run_in_threadpool(extract_camelot_tables, working_pdf)
         if not dfs:
             dfs = await run_in_threadpool(extract_pdfplumber_tables, working_pdf)
-        used_mode = "ocr"
 
+    # 2) Best forced
     elif used_mode == "best":
         dfs = await run_in_threadpool(extract_camelot_tables, working_pdf)
         if not dfs:
             dfs = await run_in_threadpool(extract_pdfplumber_tables, working_pdf)
 
+    # 3) Fast or Auto (non-scanned)
     else:
-        # fast or auto (non-scanned)
+        # Fast first
         dfs = await run_in_threadpool(extract_pdfplumber_tables, working_pdf)
 
-        # If auto: upgrade to best when weak or empty
+        # Auto upgrade if empty or weak
         if used_mode == "auto" and (not dfs or await run_in_threadpool(tables_look_weak, dfs)):
             used_mode = "best"
             dfs = await run_in_threadpool(extract_camelot_tables, working_pdf)
@@ -408,7 +526,7 @@ async def convert(
         else:
             used_mode = "fast"
 
-        # If user forced fast: still allow fallback if nothing found (optional)
+        # Optional fallback even if user forced fast: if nothing found, try best
         if used_mode == "fast" and not dfs:
             used_mode = "best"
             dfs = await run_in_threadpool(extract_camelot_tables, working_pdf)
@@ -416,25 +534,37 @@ async def convert(
                 dfs = await run_in_threadpool(extract_pdfplumber_tables, working_pdf)
 
     df = await run_in_threadpool(normalize_dfs, dfs)
-    csv_path, xlsx_path = await run_in_threadpool(write_outputs, df, file_id)
+    await run_in_threadpool(write_outputs, df, file_id)
 
     elapsed = round(time.time() - started, 3)
-    return {
+
+    payload = {
         "ok": True,
         "file_id": file_id,
         "mode_used": used_mode,
         "pages": pages,
-        "rows": 0 if df is None else int(df.shape[0]),
-        "cols": 0 if df is None else int(df.shape[1]),
+        "rows": int(df.shape[0]) if df is not None and not df.empty else 0,
+        "cols": int(df.shape[1]) if df is not None and not df.empty else 0,
         "elapsed_s": elapsed,
+        "decision": {
+            "requested_mode": (mode or "auto").lower().strip(),
+            "scanned_detected": bool(scanned),
+        },
         "downloads": {
             "csv": f"/download/{file_id}.csv",
             "xlsx": f"/download/{file_id}.xlsx",
         },
     }
 
+    if _wants_html(request):
+        return _html_result(payload)
 
-# Optional: sanity endpoint to verify binaries exist inside Render container
+    return JSONResponse(payload)
+
+
+# -----------------------------
+# Debug: confirm binaries in Render container
+# -----------------------------
 @app.get("/debug/bins")
 def debug_bins():
     import shutil as _shutil

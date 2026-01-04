@@ -1,282 +1,236 @@
-from fastapi import FastAPI, UploadFile, File, Request
-from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
-from fastapi.templating import Jinja2Templates
-
 import os
+import io
+import re
+import time
 import uuid
 import shutil
-import traceback
-from typing import List, Optional, Tuple, Dict, Any
+import logging
+import subprocess
+from datetime import datetime, timedelta
+from typing import List, Optional
 
 import pandas as pd
+from fastapi import FastAPI, File, UploadFile, Form
+from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
+from starlette.requests import Request
+
 import pdfplumber
 
-# Camelot is optional at runtime (but installed for you now)
+# Camelot is optional at runtime; if missing we fall back gracefully
 try:
     import camelot  # type: ignore
 except Exception:
-    camelot = None  # fallback mode
+    camelot = None
 
 
-# -------------------------
-# App setup
-# -------------------------
-app = FastAPI()
-templates = Jinja2Templates(directory="templates")
+APP_NAME = "pdf2sheet"
 
-UPLOAD_DIR = "uploads"
-OUTPUT_DIR = "outputs"
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+UPLOAD_DIR = os.path.join(BASE_DIR, "uploads")
+OUTPUT_DIR = os.path.join(BASE_DIR, "outputs")
+TEMPLATES_DIR = os.path.join(BASE_DIR, "templates")
+
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
+# Settings (can be overridden in Render Environment)
+MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "25"))
+RETENTION_HOURS = int(os.getenv("RETENTION_HOURS", "24"))
 
-# -------------------------
-# Helpers: cleaning/scoring
-# -------------------------
-def _strip_df(df: pd.DataFrame) -> pd.DataFrame:
-    # Avoid pandas FutureWarning: applymap deprecated
-    df = df.copy()
-    for c in df.columns:
-        df[c] = df[c].map(lambda x: str(x).strip() if x is not None else "")
-    return df
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger(APP_NAME)
 
+app = FastAPI(title=APP_NAME)
+templates = Jinja2Templates(directory=TEMPLATES_DIR)
 
-def _drop_empty_rows_cols(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-
-    # normalize empty strings
-    df = df.replace({None: "", "None": ""})
-
-    # drop fully empty rows
-    df = df.loc[~(df.apply(lambda r: all(str(v).strip() == "" for v in r), axis=1))]
-
-    # drop fully empty cols
-    df = df.loc[:, ~(df.apply(lambda c: all(str(v).strip() == "" for v in c), axis=0))]
-
-    return df
+# (optional) if you have a static folder
+static_dir = os.path.join(BASE_DIR, "static")
+if os.path.isdir(static_dir):
+    app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
 
-def _basic_quality_score(df: pd.DataFrame) -> Dict[str, Any]:
-    """
-    Heuristic score to decide if extraction is "good enough".
-    """
-    if df is None or df.empty:
-        return {"ok": False, "score": 0, "reason": "empty"}
-
-    rows, cols = df.shape
-    if rows < 2 or cols < 2:
-        return {"ok": False, "score": 0, "reason": f"too small ({rows}x{cols})"}
-
-    # count non-empty cells
-    total = rows * cols
-    non_empty = 0
-    for c in df.columns:
-        non_empty += (df[c].astype(str).str.strip() != "").sum()
-
-    density = non_empty / total if total else 0
-
-    # common failure case: a single column of long text or 1-3 cols only
-    if cols <= 3 and rows <= 10 and density < 0.35:
-        return {"ok": False, "score": 10, "reason": "sparse small table"}
-
-    # score: density + size
-    size_bonus = min(40, (rows * cols) // 20)
-    score = int(density * 60) + size_bonus
-
-    ok = score >= 35  # threshold
-    return {
-        "ok": ok,
-        "score": score,
-        "rows": rows,
-        "cols": cols,
-        "density": round(density, 3),
-        "reason": "ok" if ok else "below threshold",
-    }
+@app.get("/", response_class=HTMLResponse)
+def home(request: Request):
+    return templates.TemplateResponse("index.html", {"request": request})
 
 
-def _concat_tables_vertical(dfs: List[pd.DataFrame]) -> Optional[pd.DataFrame]:
-    """
-    Concatenate tables vertically, aligning columns by index where possible.
-    If column counts differ, we pad to max columns.
-    """
-    if not dfs:
-        return None
+@app.get("/health")
+def health():
+    return {"ok": True, "service": APP_NAME, "time": datetime.utcnow().isoformat()}
 
-    cleaned = []
-    max_cols = max(df.shape[1] for df in dfs if df is not None and not df.empty)
 
+def cleanup_old_files() -> None:
+    """Delete old uploads/outputs to keep disk from filling up (important on Render)."""
+    cutoff = datetime.utcnow() - timedelta(hours=RETENTION_HOURS)
+    for folder in (UPLOAD_DIR, OUTPUT_DIR):
+        for name in os.listdir(folder):
+            path = os.path.join(folder, name)
+            try:
+                if os.path.isfile(path):
+                    mtime = datetime.utcfromtimestamp(os.path.getmtime(path))
+                    if mtime < cutoff:
+                        os.remove(path)
+            except Exception:
+                pass
+
+
+def safe_filename(name: str) -> str:
+    name = os.path.basename(name)
+    name = re.sub(r"[^a-zA-Z0-9._-]+", "_", name)
+    return name[:120] if name else "upload.pdf"
+
+
+def count_pages(pdf_path: str) -> int:
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            return len(pdf.pages)
+    except Exception:
+        return 0
+
+
+def extract_pdfplumber_tables(pdf_path: str) -> List[pd.DataFrame]:
+    """Simple table extraction using pdfplumber."""
+    dfs: List[pd.DataFrame] = []
+    with pdfplumber.open(pdf_path) as pdf:
+        for page in pdf.pages:
+            # extract_table() gets one table; extract_tables() gets multiple
+            tables = page.extract_tables()
+            for t in tables or []:
+                if not t or len(t) < 2:
+                    continue
+                df = pd.DataFrame(t)
+                dfs.append(df)
+    return dfs
+
+
+def extract_camelot_tables(pdf_path: str) -> List[pd.DataFrame]:
+    """Stronger table extraction using Camelot (digital PDFs)."""
+    if camelot is None:
+        return []
+
+    dfs: List[pd.DataFrame] = []
+    # Try both flavors; each works better depending on PDF
+    for flavor in ("lattice", "stream"):
+        try:
+            tables = camelot.read_pdf(pdf_path, pages="all", flavor=flavor)
+            for t in tables:
+                df = t.df
+                if df is not None and df.shape[0] >= 2 and df.shape[1] >= 2:
+                    dfs.append(df)
+        except Exception:
+            continue
+    return dfs
+
+
+def normalize_dfs(dfs: List[pd.DataFrame]) -> Optional[pd.DataFrame]:
+    """Combine multiple extracted tables into one big dataframe."""
+    cleaned: List[pd.DataFrame] = []
     for df in dfs:
         if df is None or df.empty:
             continue
-        df = df.copy()
-        # pad columns
-        if df.shape[1] < max_cols:
-            for _ in range(max_cols - df.shape[1]):
-                df[df.shape[1]] = ""
-        # rename columns as integers to avoid collisions
-        df.columns = list(range(df.shape[1]))
+        # Trim whitespace
+        df = df.applymap(lambda x: x.strip() if isinstance(x, str) else x)
+
+        # Drop empty rows/cols
+        df = df.dropna(how="all")
+        df = df.dropna(axis=1, how="all")
+
+        # Skip tiny noise
+        if df.shape[0] < 2 or df.shape[1] < 2:
+            continue
+
         cleaned.append(df)
 
     if not cleaned:
         return None
 
-    out = pd.concat(cleaned, ignore_index=True)
-    out = _strip_df(out)
-    out = _drop_empty_rows_cols(out)
+    # If multiple tables, stack them with a blank row separator
+    out = cleaned[0]
+    for nxt in cleaned[1:]:
+        spacer = pd.DataFrame([[""] * max(out.shape[1], nxt.shape[1])])
+        # pad both to same width
+        w = max(out.shape[1], nxt.shape[1])
+        out = out.reindex(columns=range(w), fill_value="")
+        nxt = nxt.reindex(columns=range(w), fill_value="")
+        out = pd.concat([out, spacer, nxt], ignore_index=True)
+
     return out
 
 
-# -------------------------
-# Extractors
-# -------------------------
-def extract_with_camelot(pdf_path: str) -> Tuple[Optional[pd.DataFrame], Dict[str, Any]]:
-    """
-    Try Camelot lattice then stream.
-    Returns: (df, debug)
-    """
-    debug: Dict[str, Any] = {"engine": "camelot", "attempts": []}
-
-    if camelot is None:
-        debug["error"] = "camelot not installed"
-        return None, debug
-
-    # Try lattice first (best with ruled tables)
-    for flavor in ["lattice", "stream"]:
-        try:
-            tables = camelot.read_pdf(
-                pdf_path,
-                pages="all",
-                flavor=flavor,
-                strip_text="\n",
-            )
-            dfs = []
-            for t in tables:
-                # camelot table df is already a DataFrame
-                dfs.append(t.df)
-
-            df = _concat_tables_vertical(dfs)
-            q = _basic_quality_score(df) if df is not None else {"ok": False, "score": 0}
-
-            debug["attempts"].append(
-                {
-                    "flavor": flavor,
-                    "tables_found": len(tables),
-                    "quality": q,
-                }
-            )
-
-            if df is not None and q.get("ok"):
-                debug["selected"] = {"flavor": flavor}
-                return df, debug
-
-        except Exception as e:
-            debug["attempts"].append(
-                {"flavor": flavor, "error": str(e)}
-            )
-
-    return None, debug
-
-
-def extract_tables_pdfplumber(pdf_path: str) -> List[List[List[str]]]:
-    """
-    Extracts tables as list-of-tables, each table is list-of-rows, each row list-of-cells.
-    """
-    all_tables = []
-    with pdfplumber.open(pdf_path) as pdf:
-        for page in pdf.pages:
-            tables = page.extract_tables()
-            if tables:
-                all_tables.extend(tables)
-    return all_tables
-
-
-def tables_to_dataframe(tables: List[List[List[str]]]) -> Optional[pd.DataFrame]:
-    """
-    Convert pdfplumber tables to a single DataFrame (vertical concat).
-    """
-    if not tables:
-        return None
-
-    dfs = []
-    for t in tables:
-        if not t:
-            continue
-        df = pd.DataFrame(t)
-        dfs.append(df)
-
-    out = _concat_tables_vertical(dfs)
-    return out
-
-
-def extract_best(pdf_path: str) -> Tuple[Optional[pd.DataFrame], Dict[str, Any]]:
-    """
-    Best long-term quality strategy:
-    1) Camelot lattice -> stream
-    2) fallback pdfplumber
-    """
-    # 1) Camelot
-    df, debug = extract_with_camelot(pdf_path)
-    if df is not None:
-        return df, debug
-
-    # 2) pdfplumber fallback
-    debug2: Dict[str, Any] = {"engine": "pdfplumber"}
-    try:
-        tables = extract_tables_pdfplumber(pdf_path)
-        df2 = tables_to_dataframe(tables)
-        q = _basic_quality_score(df2) if df2 is not None else {"ok": False, "score": 0}
-        debug2["tables_found"] = len(tables)
-        debug2["quality"] = q
-
-        if df2 is None or not q.get("ok"):
-            # still return df2 if exists, but mark weak
-            debug2["warning"] = "Extraction quality low. Consider OCR for scanned PDFs."
-        return df2, {"fallback": debug, **debug2}
-    except Exception as e:
-        debug2["error"] = str(e)
-        return None, {"fallback": debug, **debug2}
-
-
-# -------------------------
-# Routes
-# -------------------------
-@app.get("/", response_class=HTMLResponse)
-def home(request: Request):
-    return templates.TemplateResponse("index.html", {"request": request})
 @app.post("/convert")
-async def convert(file: UploadFile = File(...)):
-    file_id = str(uuid.uuid4())
-    pdf_path = os.path.join(UPLOAD_DIR, f"{file_id}.pdf")
+async def convert(file: UploadFile = File(...), mode: str = Form("fast")):
+    """
+    mode:
+      - fast: pdfplumber only
+      - best: camelot first, then pdfplumber fallback
+    """
+    cleanup_old_files()
 
+    if file.content_type not in ("application/pdf", "application/x-pdf"):
+        return JSONResponse({"ok": False, "error": "Please upload a PDF."}, status_code=400)
+
+    # Size limit protection (Render disk + memory)
     content = await file.read()
+    size_mb = len(content) / (1024 * 1024)
+    if size_mb > MAX_UPLOAD_MB:
+        return JSONResponse(
+            {"ok": False, "error": f"File too large ({size_mb:.1f}MB). Limit is {MAX_UPLOAD_MB}MB."},
+            status_code=413,
+        )
 
-    MAX_SIZE = 20 * 1024 * 1024  # 20MB
-    if len(content) > MAX_SIZE:
-        return {
-            "ok": False,
-            "error": "File too large. Max size is 20MB."
-        }
+    file_id = uuid.uuid4().hex
+    original_name = safe_filename(file.filename or "upload.pdf")
+    pdf_path = os.path.join(UPLOAD_DIR, f"{file_id}_{original_name}")
 
     with open(pdf_path, "wb") as f:
         f.write(content)
 
-    tables = extract_tables_pdfplumber(pdf_path)
-    df = tables_to_dataframe(tables)
+    pages = count_pages(pdf_path)
+    started = time.time()
+
+    # Extraction pipeline
+    dfs: List[pd.DataFrame] = []
+    used_mode = mode.lower().strip()
+
+    if used_mode == "best":
+        # Try camelot first (best for digital/ruled tables)
+        dfs = extract_camelot_tables(pdf_path)
+
+        # Fallback to pdfplumber if camelot found nothing
+        if not dfs:
+            dfs = extract_pdfplumber_tables(pdf_path)
+    else:
+        # Fast mode = pdfplumber only
+        used_mode = "fast"
+        dfs = extract_pdfplumber_tables(pdf_path)
+
+    df = normalize_dfs(dfs)
 
     if df is None:
-        return {
-            "ok": False,
-            "error": "No tables detected. Try a clearer PDF."
-        }
+        took = time.time() - started
+        log.info("No tables detected. mode=%s pages=%s file=%s took=%.2fs", used_mode, pages, original_name, took)
+        return {"ok": False, "error": "No tables detected. Try Best mode or a cleaner PDF."}
 
+    # Save outputs
     csv_path = os.path.join(OUTPUT_DIR, f"{file_id}.csv")
     xlsx_path = os.path.join(OUTPUT_DIR, f"{file_id}.xlsx")
 
     df.to_csv(csv_path, index=False)
     df.to_excel(xlsx_path, index=False)
 
+    took = time.time() - started
+    log.info(
+        "Converted ok. mode=%s pages=%s tables=%s rows=%s cols=%s file=%s took=%.2fs",
+        used_mode, pages, len(dfs), df.shape[0], df.shape[1], original_name, took
+    )
+
     return {
         "ok": True,
+        "mode": used_mode,
+        "pages": int(pages),
+        "tables": int(len(dfs)),
         "csv": f"/download/{file_id}.csv",
         "xlsx": f"/download/{file_id}.xlsx",
         "rows": int(df.shape[0]),
@@ -286,8 +240,10 @@ async def convert(file: UploadFile = File(...)):
 
 @app.get("/download/{filename}")
 def download(filename: str):
+    # basic safety
+    filename = os.path.basename(filename)
     path = os.path.join(OUTPUT_DIR, filename)
     if not os.path.exists(path):
-        return JSONResponse({"ok": False, "error": "File not found."}, status_code=404)
+        return JSONResponse({"ok": False, "error": "File not found (expired). Please re-convert."}, status_code=404)
     return FileResponse(path, filename=filename)
 

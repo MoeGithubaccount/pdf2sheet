@@ -2,15 +2,18 @@
 <html>
 <head>
   <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>PDF → Spreadsheet</title>
   <style>
-    body { font-family: -apple-system, system-ui, Arial; max-width: 760px; margin: 40px auto; padding: 0 16px; }
-    .card { border: 1px solid #ddd; border-radius: 12px; padding: 18px; }
-    button { padding: 10px 14px; border-radius: 10px; border: 1px solid #111; cursor: pointer; }
-    input { padding: 10px; }
-    .muted { color: #666; font-size: 14px; }
-    .links a { display: inline-block; margin-right: 14px; }
-    .error { color: #b00020; }
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 40px; max-width: 880px; }
+    .card { border: 1px solid #e5e7eb; border-radius: 12px; padding: 18px; }
+    .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
+    .muted { color: #6b7280; }
+    .btn { background: #111827; color: #fff; border: 0; padding: 10px 14px; border-radius: 10px; cursor: pointer; }
+    .btn:disabled { opacity: 0.6; cursor: not-allowed; }
+    select, input[type=file] { padding: 10px; border-radius: 10px; border: 1px solid #d1d5db; }
+    .status { margin-top: 12px; white-space: pre-wrap; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas; }
+    a { color: #2563eb; }
   </style>
 </head>
 <body>
@@ -18,44 +21,61 @@
   <p class="muted">Upload a business PDF with tables (invoices, statements, reports). Get CSV/XLSX instantly.</p>
 
   <div class="card">
-    <input type="file" id="pdf" accept="application/pdf"/>
-    <button id="go">Convert</button>
-    <p id="status" class="muted"></p>
-    <p id="err" class="error"></p>
-    <div class="links" id="links"></div>
+    <form id="f" class="row">
+      <input type="file" name="file" accept="application/pdf" required />
+      <select name="mode" title="Extraction mode">
+        <option value="fast">⚡ Fast (best for clean, digital PDFs)</option>
+        <option value="best">🎯 Best (tries harder; slower)</option>
+      </select>
+      <button class="btn" id="btn" type="submit">Convert</button>
+    </form>
+    <div class="status" id="status"></div>
   </div>
 
   <script>
-    const go = document.getElementById("go");
-    const status = document.getElementById("status");
-    const err = document.getElementById("err");
-    const links = document.getElementById("links");
+    const f = document.getElementById("f");
+    const statusEl = document.getElementById("status");
+    const btn = document.getElementById("btn");
 
-    go.onclick = async () => {
-      err.textContent = "";
-      links.innerHTML = "";
-      const file = document.getElementById("pdf").files[0];
-      if (!file) { err.textContent = "Choose a PDF first."; return; }
+    function setStatus(msg) { statusEl.textContent = msg; }
 
-      status.textContent = "Converting…";
-      const fd = new FormData();
-      fd.append("file", file);
+    f.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      setStatus("Uploading…");
+      btn.disabled = true;
 
-      const res = await fetch("/convert", { method: "POST", body: fd });
-      const data = await res.json();
+      const form = new FormData(f);
+      try {
+        const res = await fetch("/convert", { method: "POST", body: form });
+        const data = await res.json();
 
-      if (!data.ok) {
-        status.textContent = "";
-        err.textContent = data.error || "Conversion failed.";
-        return;
+        if (!data.ok) {
+          setStatus("❌ " + (data.error || "Conversion failed"));
+          btn.disabled = false;
+          return;
+        }
+
+        setStatus(
+`Done. Extracted ${data.rows} rows × ${data.cols} cols.
+Mode: ${data.mode}
+Pages: ${data.pages}
+Tables: ${data.tables}
+
+Download CSV: ${location.origin}${data.csv}
+Download XLSX: ${location.origin}${data.xlsx}`
+        );
+
+        // Add clickable links
+        statusEl.innerHTML =
+          `Done. Extracted <b>${data.rows}</b> rows × <b>${data.cols}</b> cols.<br/>
+           <span class="muted">Mode:</span> ${data.mode} • <span class="muted">Pages:</span> ${data.pages} • <span class="muted">Tables:</span> ${data.tables}<br/><br/>
+           <a href="${data.csv}">Download CSV</a> &nbsp; • &nbsp; <a href="${data.xlsx}">Download XLSX</a>`;
+      } catch (err) {
+        setStatus("❌ Network error: " + err.message);
+      } finally {
+        btn.disabled = false;
       }
-
-      status.textContent = `Done. Extracted ${data.rows} rows × ${data.cols} cols.`;
-      links.innerHTML = `
-        <a href="${data.csv}">Download CSV</a>
-        <a href="${data.xlsx}">Download XLSX</a>
-      `;
-    };
+    });
   </script>
 </body>
 </html>
